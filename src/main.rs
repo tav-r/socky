@@ -205,7 +205,7 @@ fn get_reponse_and_transform(state: &State, config: Arc<Config>) -> ResponseAndT
                         .chain(concat(match m.socks5_addr {
                             Sock5AddressType::IPv4(ipv4) => [vec![1], ipv4.octets().to_vec()],
                             Sock5AddressType::Domain(domain) => {
-                                [vec![3], domain.as_bytes().to_vec()]
+                                [vec![3, domain.len() as u8], domain.as_bytes().to_vec()]
                             }
                             Sock5AddressType::IPv6(ipv6) => [vec![4], ipv6.octets().to_vec()],
                         }))
