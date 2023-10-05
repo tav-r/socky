@@ -1,5 +1,6 @@
 use async_recursion::async_recursion;
 use itertools::{concat, Itertools};
+
 use nom::{
     branch::alt,
     bytes::complete::{tag, take},
@@ -18,9 +19,19 @@ use tokio::{
     select,
 };
 
-type ResponseAndTransform =
-    Box<dyn Fn(Message) -> Result<(Vec<u8>, State, Option<String>), std::io::Error>>;
+type Transformation = Result<(Vec<u8>, State, Option<String>), std::io::Error>;
+type ResponseAndTransform = dyn Fn(Message) -> Transformation;
 type MessageParser = fn(&[u8]) -> Result<(&[u8], Message), nom::Err<nom::error::Error<&[u8]>>>;
+
+const SOCKS_VERSION: u8 = 5;
+const PASSWORD_AUTH: u8 = 2;
+const NO_AUTH: u8 = 0;
+
+macro_rules! curry1 {
+    ($func:expr, $x:expr) => {
+        move |y| $func($x, y)
+    };
+}
 
 #[derive(PartialEq, Debug)]
 enum State {
@@ -156,70 +167,133 @@ fn get_message_parser(state: &State) -> MessageParser {
     }
 }
 
-// Get a function that returns the response to the given message, the next state and optionally a connection string
-fn get_reponse_and_transform(state: &State, config: Arc<Config>) -> ResponseAndTransform {
-    match state {
-        // Return "password authentication" response if the client supports it, otherwise return "no acceptable authentication methods
-        State::Init => Box::new(|message| match message {
-            Message::Greeting(m) => {
-                let ver = 5;
-                let cauth = if m.auth.contains(&2) { 2 } else { 0xff };
-
-                Ok((vec![ver, cauth], State::Authenticating, None))
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid message or unsupported authentication method",
-            )),
-        }),
-        // Return "authentication successful" response if the username and password are correct, otherwise return "authentication failed"
-        State::Authenticating => Box::new(move |message| match message {
-            Message::AuthRequest(m) => {
-                let ver = 1;
-                let status = if m.id.eq(&config.username) && m.pw.eq(&config.password) {
-                    0
-                } else {
-                    println!("Authentication failed");
-                    0xff
-                };
-
-                Ok((vec![ver, status], State::Authenticated, None))
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid message or unsupported authentication method",
-            )),
-        }),
-        // Return "connection established" response and the connection string
-        State::Authenticated => Box::new(|message| match message {
-            Message::ConnectionRequest(m) => {
-                let target = format!(
-                    "{}:{}",
-                    std::convert::Into::<String>::into(&m.socks5_addr),
-                    m.dstport
-                );
-
+fn init_message_transform_auth(message: Message) -> Transformation {
+    match message {
+        Message::Greeting(m) => {
+            if m.auth.contains(&PASSWORD_AUTH) {
                 Ok((
-                    vec![5, 0, 0]
-                        .into_iter()
-                        .chain(concat(match m.socks5_addr {
-                            Sock5AddressType::IPv4(ipv4) => [vec![1], ipv4.octets().to_vec()],
-                            Sock5AddressType::Domain(domain) => {
-                                [vec![3, domain.len() as u8], domain.as_bytes().to_vec()]
-                            }
-                            Sock5AddressType::IPv6(ipv6) => [vec![4], ipv6.octets().to_vec()],
-                        }))
-                        .chain(m.dstport.to_be_bytes().to_vec())
-                        .collect::<Vec<u8>>(),
-                    State::Connected,
-                    Some(target),
+                    vec![SOCKS_VERSION, PASSWORD_AUTH],
+                    State::Authenticating,
+                    None,
+                ))
+            } else {
+                // if anonymous auth is not supported, just close the connection
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported authentication method(s)",
                 ))
             }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid message",
-            )),
-        }),
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid message",
+        )),
+    }
+}
+
+fn init_message_transform_anon(message: Message) -> Transformation {
+    match message {
+        Message::Greeting(m) => {
+            if m.auth.contains(&NO_AUTH) {
+                Ok((vec![SOCKS_VERSION, NO_AUTH], State::Authenticated, None))
+            } else {
+                // if anonymous auth is not supported, just close the connection
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported authentication method(s)",
+                ))
+            }
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid message",
+        )),
+    }
+}
+
+fn auth_message_transform(auth_info: Option<Arc<AuthInfo>>, message: Message) -> Transformation {
+    match message {
+        Message::AuthRequest(m) => {
+            if let Some((username, password)) = auth_info
+                .as_ref()
+                .map(|a| (String::from(&a.username), String::from(&a.password)))
+            {
+                if m.id.eq(&username) && m.pw.eq(&password) {
+                    Ok((
+                        vec![SOCKS_VERSION, PASSWORD_AUTH],
+                        State::Authenticated,
+                        None,
+                    ))
+                } else {
+                    println!("Authentication failed");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid username or password",
+                    ))
+                }
+            } else {
+                Ok((vec![SOCKS_VERSION, NO_AUTH], State::Authenticated, None))
+            }
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid message or unsupported authentication method",
+        )),
+    }
+}
+
+fn connect_message_transform(message: Message) -> Transformation {
+    match message {
+        Message::ConnectionRequest(m) => {
+            let target = format!(
+                "{}:{}",
+                std::convert::Into::<String>::into(&m.socks5_addr),
+                m.dstport
+            );
+
+            Ok((
+                vec![5, 0, 0]
+                    .into_iter()
+                    .chain(concat(match m.socks5_addr {
+                        Sock5AddressType::IPv4(ipv4) => [vec![1], ipv4.octets().to_vec()],
+                        Sock5AddressType::Domain(domain) => {
+                            [vec![3, domain.len() as u8], domain.as_bytes().to_vec()]
+                        }
+                        Sock5AddressType::IPv6(ipv6) => [vec![4], ipv6.octets().to_vec()],
+                    }))
+                    .chain(m.dstport.to_be_bytes().to_vec())
+                    .collect::<Vec<u8>>(),
+                State::Connected,
+                Some(target),
+            ))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid message",
+        )),
+    }
+}
+
+// Get a function that returns the response to the given message, the next state and optionally a connection string
+fn get_reponse_and_transform(
+    state: &State,
+    auth_info: Option<Arc<AuthInfo>>,
+) -> Box<ResponseAndTransform> {
+    let auth_required = auth_info.is_some();
+
+    match state {
+        // Return "password authentication" response if the client supports it, otherwise return "no acceptable authentication methods
+        State::Init => {
+            if auth_required {
+                Box::new(init_message_transform_auth)
+            } else {
+                Box::new(init_message_transform_anon)
+            }
+        }
+        // Return "authentication successful" response if the username and password are correct, otherwise return "authentication failed"
+        State::Authenticating => Box::new(curry1!(auth_message_transform, auth_info.clone())),
+        // Return "connection established" response and the connection string
+        State::Authenticated => Box::new(connect_message_transform),
         State::Connected => panic!("tried to get response in connected state"),
     }
 }
@@ -228,7 +302,7 @@ async fn process(
     state: State,
     mut stream: TcpStream,
     buf: &mut [u8],
-    config: Arc<Config>,
+    config: Option<Arc<AuthInfo>>,
 ) -> Result<(State, TcpStream, Option<TcpStream>), Box<dyn std::error::Error>> {
     // read from stream
     let n = stream.read(buf).await?;
@@ -262,7 +336,7 @@ async fn process(
 async fn process_protocol(
     state: State,
     client_stream: TcpStream,
-    config: Arc<Config>,
+    config: Option<Arc<AuthInfo>>,
 ) -> Result<(State, TcpStream, TcpStream), Box<dyn std::error::Error>> {
     let mut buf = [0u8; 1024];
     let (next_state, client_stream, remote_stream) =
@@ -280,7 +354,7 @@ async fn process_protocol(
 }
 
 #[derive(Debug)]
-struct Config {
+struct AuthInfo {
     pub username: String,
     pub password: String,
 }
@@ -290,34 +364,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = args().skip(1);
 
     let bind_string = arguments.next().ok_or("No bind string provided")?;
-    let creds_arg = arguments
+
+    let auth_info = arguments
         .next()
-        .ok_or("No username and password provided")?;
-
-    let (username, password) = creds_arg
-        .splitn(2, ':')
-        .collect_tuple()
-        .ok_or("Invalid username:password string")?;
-
-    let config = Arc::new(Config {
-        username: username.to_string(),
-        password: password.to_string(),
-    });
+        .map(|s| {
+            s.splitn(2, ':')
+                .collect_tuple()
+                .map(|(u, p)| {
+                    Arc::new(AuthInfo {
+                        username: u.to_string(),
+                        password: p.to_string(),
+                    })
+                })
+                .ok_or("Invalid auth info")
+        })
+        .transpose()?;
 
     let listener = TcpListener::bind(&bind_string).await?;
 
     loop {
         let (stream, _addr) = listener.accept().await?;
 
-        let config = config.clone();
+        let auth_info = auth_info.clone();
 
         tokio::spawn(async move {
-            let (_, client_stream, remote_stream) = process_protocol(State::Init, stream, config)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("error while processing protocol: {}", e);
-                    panic!()
-                });
+            let (_, client_stream, remote_stream) =
+                process_protocol(State::Init, stream, auth_info)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("error while processing protocol: {}", e);
+                        panic!()
+                    });
 
             // forward packets from client to target server and vice versa if connection was established
             let (mut cread, mut cwrite) = split(client_stream);
