@@ -24,8 +24,11 @@ type ResponseAndTransform = dyn Fn(Message) -> Transformation;
 type MessageParser = fn(&[u8]) -> Result<(&[u8], Message), nom::Err<nom::error::Error<&[u8]>>>;
 
 const SOCKS_VERSION: u8 = 5;
-const PASSWORD_AUTH: u8 = 2;
+const USERNAME_PW_LOGIN: u8 = 2;
 const NO_AUTH: u8 = 0;
+const TCP_IP_STREAM_COMMAND: u8 = 1;
+const USERNAME_PW_LOGIN_VERSION: u8 = 1;
+const NULL_BYTE: u8 = 0;
 
 macro_rules! curry1 {
     ($func:expr, $x:expr) => {
@@ -89,7 +92,7 @@ fn get_message_parser(state: &State) -> MessageParser {
         State::Init => |input| {
             map(
                 tuple((
-                    tag(&[5u8]),           // version, must be 0x05
+                    tag(&[SOCKS_VERSION]), // version, must be 0x05
                     flat_map(nomu8, take), // read the specified number of auth methods
                 )),
                 // transform the parsed data into a ClientGreeting struct wrapped in a Message enum
@@ -104,7 +107,7 @@ fn get_message_parser(state: &State) -> MessageParser {
         State::Authenticating => |input| {
             map(
                 tuple((
-                    tag(&[1u8]),           // auth version, only username/password is supported
+                    tag(&[USERNAME_PW_LOGIN_VERSION]), // auth version, current version is 1
                     flat_map(nomu8, take), // read the specified number of username bytes
                     flat_map(nomu8, take), // read the specified number of password bytes
                 )),
@@ -148,9 +151,9 @@ fn get_message_parser(state: &State) -> MessageParser {
 
             map(
                 tuple((
-                    tag(&[5u8]), // SOCKS5 version
-                    tag(&[1u8]), // command, currently TCP Port Binding and UDP are not supported
-                    tag(&[0u8]), // RSV must be 0x00
+                    tag(&[SOCKS_VERSION]),         // SOCKS5 version
+                    tag(&[TCP_IP_STREAM_COMMAND]), // command, currently TCP Port Binding and UDP are not supported
+                    tag(&[NULL_BYTE]),             // RSV must be a NULL byte
                     alt((ipv4_parser, domain_parser, ipv6_parser)),
                     nomu16(Endianness::Big),
                 )),
@@ -170,9 +173,9 @@ fn get_message_parser(state: &State) -> MessageParser {
 fn init_message_transform_auth(message: Message) -> Transformation {
     match message {
         Message::Greeting(m) => {
-            if m.auth.contains(&PASSWORD_AUTH) {
+            if m.auth.contains(&USERNAME_PW_LOGIN) {
                 Ok((
-                    vec![SOCKS_VERSION, PASSWORD_AUTH],
+                    vec![SOCKS_VERSION, USERNAME_PW_LOGIN],
                     State::Authenticating,
                     None,
                 ))
@@ -220,7 +223,7 @@ fn auth_message_transform(auth_info: Option<Arc<AuthInfo>>, message: Message) ->
             {
                 if m.id.eq(&username) && m.pw.eq(&password) {
                     Ok((
-                        vec![SOCKS_VERSION, PASSWORD_AUTH],
+                        vec![USERNAME_PW_LOGIN_VERSION, NULL_BYTE], // NULL byte indicates successful authentication
                         State::Authenticated,
                         None,
                     ))
